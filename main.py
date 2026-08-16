@@ -40,6 +40,8 @@ PARAMS = {
     # around fib(13) = $377, so the cost cap rather than the count is the real gate.
     "max_hands": 14,            # hard cap on hires per day
     "max_hire_cost": 400,       # never pay more than this for a single hand
+    "cheap_hire_cost": 60,      # always take hands costing at most this (see plan_hires)
+    "cheap_hire_frac": 0.015,   # ... but never more than this share of the bank
     "hire_cash_frac": 0.5,      # spend at most this share of cash on a day's hires
     # Over-hire vs. the estimated work. Deliberately large: once expected_jobs stopped
     # counting idle tiles the estimate got honest, and honest under-hires, because it
@@ -128,6 +130,8 @@ PARAMS = {
     # Opponent-aware selling. Their farm is public, so their pending supply is
     # knowable; on a shallow curve, selling first is most of the edge.
     "rival_supply_threshold": 8,
+    # How heavily a rival's visible pending supply discounts our own buy decision.
+    "rival_pipeline_weight": 0.0,   # measured worse at 1.0 and 2.0; see notes
     "rival_floor_discount": 0.62,
     # A collect action competes with CARE on a cow (+1 milk, ~$280). Its market price
     # is the wrong yardstick once we grow ongoing crops, though: applied to a
@@ -699,13 +703,21 @@ class Brain(object):
 
     # -- profit per worker-action, at live prices --------------------------- #
     def marginal_price(self, st, item, pipeline):
-        """Price once our own committed production has also been sold.
+        """Price once our own committed production -- and the rival's -- has sold.
 
         Scoring at today's quote makes a crop look equally good on its 1st and 40th
         tile; melon's quadratic glut curve punishes that badly. Pricing the marginal
         tile behind everything already in the ground is what stops the overshoot.
+
+        The rival's herd counts too, and their farm is public. Ladder replays showed
+        this agent finishing with 20-27 animals against 2-8 crops: milk and wool look
+        wonderful early because nobody has supplied them yet, so it kept buying cows
+        until every tile was livestock. When the opponent also ran animals both curves
+        collapsed, and with no crops to fall back on our score fell to $28-58k in games
+        we were otherwise winning. Supply we can see coming should discount the buy.
         """
         inv = st.mkt_inv.get(item, MARKET_I0) + max(0, int(pipeline))
+        inv += int(self.opp_supply.get(item, 0) * PARAMS["rival_pipeline_weight"])
         return market_price(item, inv, st.mparams)
 
     def crop_score(self, st, crop):
@@ -956,6 +968,22 @@ class Brain(object):
 
         want = min(PARAMS["max_hands"],
                    max(0, int(math.ceil(work / float(st.turns_per_day))) - 1))
+        # The Fibonacci curve makes the first several hands almost free -- 6 hands is
+        # $20, 9 is $88 against a $3,000 bank. An idle hand wastes pocket change; a
+        # missing one wastes 24 actions on a setup day. So take every hand whose own
+        # price is a rounding error, regardless of what the work estimate says.
+        # Capped against the bank as well as absolutely: with a small `startingMoney`
+        # a flat $60 ceiling buys 9 hands out of a $200 bank and starves the farm of
+        # seed money (measured: $41,987 -> $1,756).
+        allowance = min(PARAMS["cheap_hire_cost"], st.money * PARAMS["cheap_hire_frac"])
+        cheap, spent_cheap = 0, 0
+        while cheap < PARAMS["max_hands"]:
+            cost = st.hire_mult * _fib(st.hires_today + cheap)
+            if cost > allowance or spent_cheap + cost > allowance:
+                break
+            spent_cheap += cost
+            cheap += 1
+        want = max(want, cheap)
         budget = st.money * PARAMS["hire_cash_frac"]
         n, spent = 0, 0
         while n < want:
